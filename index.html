@@ -1,0 +1,820 @@
+<!DOCTYPE html>
+<!--
+  Spielshow Game Show App
+  -----------------------
+  Diese HTML-Datei implementiert eine einfache Spielshow,
+  die von einem Spielleiter (Host) gesteuert wird. Freunde
+  können über den gleichen Link beitreten und ihre Antworten
+  abgeben oder buzzern. Die Synchronisation erfolgt in Echtzeit
+  über Firebase Cloud Firestore (kostenlos im Spark-Plan).
+
+  Um die App einzusetzen, benötigst du lediglich einen gültigen
+  Firebase‑Projekt‑Konfigurationsblock. Dieser ist hier bereits
+  eingetragen, kann aber durch deinen eigenen ersetzt werden.
+  Weitere Instruktionen findest du im Chat.
+
+  Funktionen:
+  - Host/Spieler wählen beim Start
+  - Host loggt sich mit festem Namen & Passwort ein (paul / Königlibellen)
+  - Raum-Code wählen (z. B. „quizabend“); Link einfach teilen
+  - Host kann Fragen stellen, Timer starten, Buzzern freigeben,
+    Punkte vergeben, Spieler hinzufügen/umbenennen/färben
+  - Spieler geben Antworten ein, buzzern und sehen, wer der Erste war
+  - Host entscheidet, ob Scores und Antworten sichtbar sind
+  - Alles synchronisiert sich sofort über Firestore auf allen Geräten
+-->
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1.0">
+  <title>Spielshow Live</title>
+  <!-- TailwindCSS über CDN für schnelles Styling -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Firebase SDKs als ES-Module -->
+  <script type="importmap">
+    {
+      "imports": {
+        "firebase/app": "https://www.gstatic.com/firebasejs/10.12.4/firebase-app.js",
+        "firebase/firestore": "https://www.gstatic.com/firebasejs/10.12.4/firebase-firestore.js"
+      }
+    }
+  </script>
+</head>
+<body class="bg-gray-900 text-gray-100 font-sans min-h-screen">
+  <div id="app" class="container mx-auto p-4"></div>
+
+  <script type="module">
+    import { initializeApp } from 'firebase/app';
+    import {
+      getFirestore,
+      doc,
+      getDoc,
+      setDoc,
+      updateDoc,
+      onSnapshot,
+      arrayUnion
+    } from 'firebase/firestore';
+
+    /**
+     * Firebase-Konfiguration. Hier die Daten deines eigenen Projektes
+     * eintragen (apiKey, authDomain, projectId, appId etc.).
+     * Die folgenden Werte stammen aus dem Beispielprojekt und
+     * funktionieren nur, wenn das Projekt existiert und freigegeben ist.
+     */
+    const firebaseConfig = {
+      apiKey: "AIZaSyDRIZmAJk3QqNzPJNeFR9J1RlZHdZ3vEYA",
+      authDomain: "spielshow-81f69.firebaseapp.com",
+      projectId: "spielshow-81f69",
+      storageBucket: "spielshow-81f69.appspot.com",
+      messagingSenderId: "811587397192",
+      appId: "1:811587397192:web:d9634ffa14af1c14f49a7d",
+      measurementId: "G-8CNEBRR72J"
+    };
+
+    // Firebase-Initialisierung
+    const app = initializeApp(firebaseConfig);
+    const db = getFirestore(app);
+
+    /**
+     * Berechnet eine konsistente Farbe zu einem Namen.
+     * Zum Beispiel erhält jeder Spieler seine Farbe anhand seines Namens.
+     */
+    function colorFromName(name) {
+      const palette = [
+        '#60A5FA', '#F472B6', '#34D399', '#FBBF24', '#A78BFA',
+        '#F87171', '#22D3EE', '#FB7185', '#F59E0B', '#4ADE80'
+      ];
+      let hash = 0;
+      for (let i = 0; i < name.length; i++) {
+        hash = (hash << 5) - hash + name.charCodeAt(i);
+        hash |= 0;
+      }
+      return palette[Math.abs(hash) % palette.length];
+    }
+
+    /**
+     * Erzeugt eine zufällige ID (8 Zeichen alphanumerisch).
+     */
+    function randomId() {
+      return Math.random().toString(36).substring(2, 10);
+    }
+
+    /**
+     * Initialzustand eines Raums. Wird gesetzt, wenn der Raum noch nicht existiert.
+     */
+    function createInitialState(roomId) {
+      return {
+        meta: {
+          opened: false,
+          createdAt: Date.now(),
+          hostName: null
+        },
+        host: {
+          showScores: true,
+          showPlayers: true,
+          showAnswers: false,
+          themeColor: '#111827'
+        },
+        game: {
+          question: 'Willkommen!',
+          subtext: 'Warte auf den Spielleiter …'
+        },
+        roster: {},
+        order: [],
+        buzzer: {
+          armed: false,
+          list: [],
+          lastResetAt: Date.now()
+        },
+        timer: {
+          running: false,
+          endsAt: null,
+          durationMs: 60000,
+          startedAt: null
+        }
+      };
+    }
+
+    /**
+     * Liest Query-Parameter aus der URL.
+     */
+    function getQueryParam(name) {
+      const urlParams = new URLSearchParams(window.location.search);
+      return urlParams.get(name);
+    }
+
+    /**
+     * Setzt einen Query-Parameter (z. B. room) in der URL, ohne die Seite neu zu laden.
+     */
+    function setQueryParam(key, value) {
+      const url = new URL(window.location.href);
+      if (value === null) url.searchParams.delete(key);
+      else url.searchParams.set(key, value);
+      history.replaceState({}, '', url.toString());
+    }
+
+    /**
+     * Globale Variablen für aktuelle Sitzung.
+     */
+    let currentRoomId = getQueryParam('room') || '';
+    let currentRole = null;    // 'host' oder 'player'
+    const userId = sessionStorage.getItem('spielshow_user') || randomId();
+    sessionStorage.setItem('spielshow_user', userId);
+
+    let unsubscribe = null; // Firestore Listener für Raum
+
+    // Root-Element
+    const appContainer = document.getElementById('app');
+
+    /**
+     * Rendert die Startansicht, in der der Benutzer den Raumcode eingeben
+     * und auswählen kann, ob er Spielleiter oder Spieler ist.
+     */
+    function renderStartView() {
+      appContainer.innerHTML = '';
+      const wrapper = document.createElement('div');
+      wrapper.className = 'max-w-lg mx-auto bg-gray-800 rounded-xl p-6 space-y-4';
+
+      const title = document.createElement('h1');
+      title.className = 'text-2xl font-bold mb-2 text-center';
+      title.textContent = 'Showtime Live';
+      wrapper.appendChild(title);
+
+      const roomLabel = document.createElement('label');
+      roomLabel.className = 'block text-sm font-medium mb-1';
+      roomLabel.textContent = 'Raumcode';
+      const roomInput = document.createElement('input');
+      roomInput.type = 'text';
+      roomInput.placeholder = 'quizabend';
+      roomInput.value = currentRoomId;
+      roomInput.className = 'w-full p-2 rounded bg-gray-700 border border-gray-600';
+      roomLabel.appendChild(roomInput);
+      wrapper.appendChild(roomLabel);
+
+      const btnContainer = document.createElement('div');
+      btnContainer.className = 'flex justify-between mt-4';
+
+      const hostBtn = document.createElement('button');
+      hostBtn.textContent = 'Ich bin Spielleiter';
+      hostBtn.className = 'bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded';
+      hostBtn.addEventListener('click', () => {
+        const code = roomInput.value.trim();
+        if (!code) {
+          alert('Bitte gib einen Raumcode ein.');
+          return;
+        }
+        currentRoomId = code;
+        setQueryParam('room', code);
+        askHostLogin();
+      });
+      btnContainer.appendChild(hostBtn);
+
+      const playerBtn = document.createElement('button');
+      playerBtn.textContent = 'Ich bin Spieler';
+      playerBtn.className = 'bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded';
+      playerBtn.addEventListener('click', () => {
+        const code = roomInput.value.trim();
+        if (!code) {
+          alert('Bitte gib einen Raumcode ein.');
+          return;
+        }
+        currentRoomId = code;
+        setQueryParam('room', code);
+        currentRole = 'player';
+        // Abonnieren und anzeigen, sobald Raum existiert/öffnet
+        showPlayerWaiting();
+      });
+      btnContainer.appendChild(playerBtn);
+
+      wrapper.appendChild(btnContainer);
+      appContainer.appendChild(wrapper);
+    }
+
+    /**
+     * Fragt den Spielleiter nach Name und Passwort und zeigt bei Erfolg die Host-View.
+     */
+    function askHostLogin() {
+      appContainer.innerHTML = '';
+      const wrapper = document.createElement('div');
+      wrapper.className = 'max-w-md mx-auto bg-gray-800 rounded-xl p-6 space-y-4';
+      const title = document.createElement('h2');
+      title.className = 'text-xl font-bold';
+      title.textContent = 'Host-Login';
+      wrapper.appendChild(title);
+
+      const nameLabel = document.createElement('label');
+      nameLabel.className = 'block text-sm font-medium';
+      nameLabel.textContent = 'Name';
+      const nameInput = document.createElement('input');
+      nameInput.className = 'w-full p-2 rounded bg-gray-700 border border-gray-600';
+      nameInput.placeholder = 'paul';
+      nameLabel.appendChild(nameInput);
+      wrapper.appendChild(nameLabel);
+
+      const pwdLabel = document.createElement('label');
+      pwdLabel.className = 'block text-sm font-medium mt-3';
+      pwdLabel.textContent = 'Passwort';
+      const pwdInput = document.createElement('input');
+      pwdInput.type = 'password';
+      pwdInput.className = 'w-full p-2 rounded bg-gray-700 border border-gray-600';
+      pwdInput.placeholder = 'Königlibellen';
+      pwdLabel.appendChild(pwdInput);
+      wrapper.appendChild(pwdLabel);
+
+      const loginBtn = document.createElement('button');
+      loginBtn.textContent = 'Anmelden';
+      loginBtn.className = 'bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded mt-4 w-full';
+      loginBtn.addEventListener('click', async () => {
+        const name = nameInput.value.trim().toLowerCase();
+        const pwd = pwdInput.value;
+        if (name !== 'paul' || pwd !== 'Königlibellen') {
+          alert('Falscher Name oder Passwort.');
+          return;
+        }
+        currentRole = 'host';
+        // Raum initialisieren oder öffnen
+        await initRoomAsHost(name);
+        renderHostView();
+      });
+      wrapper.appendChild(loginBtn);
+
+      const backBtn = document.createElement('button');
+      backBtn.textContent = 'Zurück';
+      backBtn.className = 'text-sm text-gray-400 hover:text-gray-200 mt-2';
+      backBtn.addEventListener('click', () => {
+        renderStartView();
+      });
+      wrapper.appendChild(backBtn);
+
+      appContainer.appendChild(wrapper);
+    }
+
+    /**
+     * Initialisiert einen Raum. Wenn der Raum noch nicht existiert, wird
+     * der Initialzustand geschrieben. Danach wird der Raum geöffnet
+     * und die Host-Informationen gesetzt.
+     */
+    async function initRoomAsHost(hostName) {
+      const roomRef = doc(db, 'rooms', currentRoomId);
+      const snapshot = await getDoc(roomRef);
+      if (!snapshot.exists()) {
+        const initialState = createInitialState(currentRoomId);
+        initialState.meta.opened = true;
+        initialState.meta.hostName = hostName;
+        await setDoc(roomRef, initialState);
+      } else {
+        // Raum öffnen und Host setzen
+        await updateDoc(roomRef, {
+          'meta.opened': true,
+          'meta.hostName': hostName
+        });
+      }
+    }
+
+    /**
+     * Zeigt eine Warteansicht für Spieler, bis der Raum geöffnet wird.
+     */
+    function showPlayerWaiting() {
+      appContainer.innerHTML = '';
+      const wrapper = document.createElement('div');
+      wrapper.className = 'max-w-md mx-auto bg-gray-800 rounded-xl p-6 text-center space-y-4';
+      const msg = document.createElement('p');
+      msg.textContent = 'Warte, bis der Raum vom Spielleiter geöffnet wird…';
+      wrapper.appendChild(msg);
+      appContainer.appendChild(wrapper);
+      // Listen für Raumänderungen
+      subscribeToRoomDoc();
+    }
+
+    /**
+     * Abonniert den Raum-Dokument-Listener. Je nach Rolle wird
+     * der passende View aktualisiert. Vorherige Listener werden
+     * abgemeldet.
+     */
+    function subscribeToRoomDoc() {
+      if (unsubscribe) unsubscribe();
+      const roomRef = doc(db, 'rooms', currentRoomId);
+      unsubscribe = onSnapshot(roomRef, (docSnap) => {
+        if (!docSnap.exists()) {
+          // Noch nicht vorhanden
+          if (currentRole === 'player') {
+            // Spieler wartet weiter
+            return;
+          }
+        }
+        const data = docSnap.data();
+        // Wenn Raum noch nicht offen, Spieler wartet weiter
+        if (currentRole === 'player' && !data.meta.opened) {
+          return;
+        }
+        // Wenn Spieler und er ist noch nicht in roster, hinzufügen
+        if (currentRole === 'player') {
+          ensurePlayerInRoster(data);
+        }
+        // UI aktualisieren
+        if (currentRole === 'host') {
+          updateHostUI(data);
+        } else if (currentRole === 'player') {
+          updatePlayerUI(data);
+        }
+      });
+    }
+
+    /**
+     * Fügt den aktuellen Spieler in den Roster ein, falls nicht vorhanden.
+     */
+    async function ensurePlayerInRoster(state) {
+      if (state.roster && state.roster[userId]) return;
+      // Spielername abfragen
+      let name = sessionStorage.getItem('spielshow_name');
+      if (!name) {
+        name = prompt('Wie heißt du?');
+        if (!name) name = 'Spieler';
+        sessionStorage.setItem('spielshow_name', name);
+      }
+      const color = colorFromName(name);
+      const roomRef = doc(db, 'rooms', currentRoomId);
+      try {
+        await updateDoc(roomRef, {
+          [`roster.${userId}`]: {
+            id: userId,
+            name: name,
+            color: color,
+            score: 0,
+            answer: ''
+          },
+          order: arrayUnion(userId)
+        });
+      } catch (err) {
+        console.error('Fehler beim Hinzufügen des Spielers:', err);
+      }
+    }
+
+    /**
+     * Erstellt einfache Helper zum Erstellen von DOM-Elementen.
+     */
+    function createElement(tag, className, text) {
+      const el = document.createElement(tag);
+      if (className) el.className = className;
+      if (text !== undefined) el.textContent = text;
+      return el;
+    }
+
+    /**
+     * Rendert die Host-Ansicht. Diese Funktion wird aufgerufen,
+     * nachdem der Host erfolgreich angemeldet ist. Der Listener
+     * auf den Raum wird gesetzt und die UI aktualisiert sich
+     * automatisch via updateHostUI().
+     */
+    function renderHostView() {
+      // Rahmen für Host-Ansicht erstellen
+      appContainer.innerHTML = '';
+      const layout = createElement('div', 'space-y-4');
+      // Überschrift
+      const header = createElement('div', 'flex items-center justify-between');
+      const title = createElement('h2', 'text-xl font-bold', `Raum: ${currentRoomId}`);
+      header.appendChild(title);
+      const logoutBtn = createElement('button', 'text-sm text-red-400 hover:text-red-200');
+      logoutBtn.textContent = 'Logout';
+      logoutBtn.addEventListener('click', () => {
+        currentRole = null;
+        if (unsubscribe) unsubscribe();
+        setQueryParam('room', null);
+        renderStartView();
+      });
+      header.appendChild(logoutBtn);
+      layout.appendChild(header);
+      // Container für dynamische Inhalte
+      const content = createElement('div', 'space-y-6');
+      layout.appendChild(content);
+      appContainer.appendChild(layout);
+      // Abonnieren
+      subscribeToRoomDoc();
+    }
+
+    /**
+     * Aktualisiert die Host-UI anhand des Raumzustands.
+     */
+    function updateHostUI(state) {
+      // Die Host-View besteht aus mehreren Abschnitten: Raumstatus, Frage, Timer,
+      // Buzzer, Spieler-Liste und Sichtbarkeitseinstellungen.
+      const layout = appContainer.firstChild; // Der äußere Wrapper (space-y-4)
+      // Entferne ggf. bereits vorhandene content-Children und baue neu
+      const content = layout.children[1];
+      content.innerHTML = '';
+
+      // Sektion: Raumstatus & Öffnen/Schließen
+      const roomSec = createElement('div', 'space-y-2');
+      roomSec.appendChild(createElement('h3', 'font-semibold', 'Raumstatus'));
+      const statusRow = createElement('div', 'flex items-center gap-2');
+      const status = createElement('span', 'text-sm', state.meta.opened ? 'Geöffnet' : 'Geschlossen');
+      status.classList.add(state.meta.opened ? 'text-green-400' : 'text-red-400');
+      statusRow.appendChild(status);
+      const btn = createElement('button', 'px-3 py-1 rounded text-sm');
+      if (state.meta.opened) {
+        btn.textContent = 'Schließen';
+        btn.classList.add('bg-red-600', 'hover:bg-red-700');
+        btn.addEventListener('click', async () => {
+          await updateDoc(doc(db, 'rooms', currentRoomId), {
+            'meta.opened': false,
+            'buzzer.armed': false,
+            'buzzer.list': []
+          });
+        });
+      } else {
+        btn.textContent = 'Öffnen';
+        btn.classList.add('bg-green-600', 'hover:bg-green-700');
+        btn.addEventListener('click', async () => {
+          await updateDoc(doc(db, 'rooms', currentRoomId), {
+            'meta.opened': true
+          });
+        });
+      }
+      statusRow.appendChild(btn);
+      roomSec.appendChild(statusRow);
+      content.appendChild(roomSec);
+
+      // Sektion: Frage & Subtext
+      const qSec = createElement('div', 'space-y-2');
+      qSec.appendChild(createElement('h3', 'font-semibold', 'Frage'));
+      const qInput = createElement('textarea', 'w-full p-2 rounded bg-gray-700 border border-gray-600');
+      qInput.value = state.game.question || '';
+      qInput.addEventListener('change', async (e) => {
+        await updateDoc(doc(db, 'rooms', currentRoomId), {
+          'game.question': e.target.value
+        });
+      });
+      qSec.appendChild(qInput);
+      const subInput = createElement('input', 'w-full p-2 rounded bg-gray-700 border border-gray-600');
+      subInput.value = state.game.subtext || '';
+      subInput.addEventListener('change', async (e) => {
+        await updateDoc(doc(db, 'rooms', currentRoomId), {
+          'game.subtext': e.target.value
+        });
+      });
+      qSec.appendChild(subInput);
+      content.appendChild(qSec);
+
+      // Sektion: Timer
+      const tSec = createElement('div', 'space-y-2');
+      tSec.appendChild(createElement('h3', 'font-semibold', 'Timer'));
+      const timerRow = createElement('div', 'flex items-center gap-2');
+      const timeLeft = state.timer.running && state.timer.endsAt ? Math.max(0, state.timer.endsAt - Date.now()) : 0;
+      const mins = Math.floor(timeLeft / 60000);
+      const secs = Math.floor((timeLeft % 60000) / 1000);
+      const timerDisplay = createElement('span', 'text-lg font-mono');
+      timerDisplay.textContent = `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+      timerRow.appendChild(timerDisplay);
+      // Timer Buttons
+      const startBtn = createElement('button', 'px-3 py-1 rounded text-sm bg-blue-600 hover:bg-blue-700', 'Start 1 min');
+      startBtn.addEventListener('click', async () => {
+        const now = Date.now();
+        await updateDoc(doc(db, 'rooms', currentRoomId), {
+          'timer.running': true,
+          'timer.startedAt': now,
+          'timer.durationMs': 60000,
+          'timer.endsAt': now + 60000
+        });
+      });
+      const stopBtn = createElement('button', 'px-3 py-1 rounded text-sm bg-gray-600 hover:bg-gray-700', 'Stop');
+      stopBtn.addEventListener('click', async () => {
+        await updateDoc(doc(db, 'rooms', currentRoomId), {
+          'timer.running': false,
+          'timer.endsAt': null
+        });
+      });
+      const resetBtn = createElement('button', 'px-3 py-1 rounded text-sm bg-gray-600 hover:bg-gray-700', 'Reset');
+      resetBtn.addEventListener('click', async () => {
+        await updateDoc(doc(db, 'rooms', currentRoomId), {
+          'timer.running': false,
+          'timer.startedAt': null,
+          'timer.endsAt': null
+        });
+      });
+      timerRow.appendChild(startBtn);
+      timerRow.appendChild(stopBtn);
+      timerRow.appendChild(resetBtn);
+      tSec.appendChild(timerRow);
+      content.appendChild(tSec);
+
+      // Sektion: Buzzer
+      const buzzSec = createElement('div', 'space-y-2');
+      buzzSec.appendChild(createElement('h3', 'font-semibold', 'Buzzer'));
+      const buzzRow = createElement('div', 'flex items-center gap-2 flex-wrap');
+      const armBtn = createElement('button', 'px-3 py-1 rounded text-sm');
+      if (state.buzzer.armed) {
+        armBtn.textContent = 'Buzzer sperren';
+        armBtn.className += ' bg-red-600 hover:bg-red-700';
+      } else {
+        armBtn.textContent = 'Buzzer freigeben';
+        armBtn.className += ' bg-green-600 hover:bg-green-700';
+      }
+      armBtn.addEventListener('click', async () => {
+        const newState = state.buzzer.armed;
+        await updateDoc(doc(db, 'rooms', currentRoomId), {
+          'buzzer.armed': !newState,
+          'buzzer.list': !newState ? [] : state.buzzer.list
+        });
+      });
+      buzzRow.appendChild(armBtn);
+      const resetBuzz = createElement('button', 'px-3 py-1 rounded text-sm bg-gray-600 hover:bg-gray-700', 'Reset');
+      resetBuzz.addEventListener('click', async () => {
+        await updateDoc(doc(db, 'rooms', currentRoomId), {
+          'buzzer.armed': false,
+          'buzzer.list': [],
+          'buzzer.lastResetAt': Date.now()
+        });
+      });
+      buzzRow.appendChild(resetBuzz);
+      buzzSec.appendChild(buzzRow);
+      // Zeige Liste der Buzzer-Reihenfolge
+      if (state.buzzer.list && state.buzzer.list.length > 0) {
+        const list = state.buzzer.list.map(id => state.roster[id]?.name || id).join(' → ');
+        const listEl = createElement('p', 'text-sm italic text-yellow-400');
+        listEl.textContent = 'Reihenfolge: ' + list;
+        buzzSec.appendChild(listEl);
+      }
+      content.appendChild(buzzSec);
+
+      // Sektion: Spieler-Liste
+      const playersSec = createElement('div', 'space-y-2');
+      playersSec.appendChild(createElement('h3', 'font-semibold', 'Spieler'));
+      const playersList = createElement('div', 'space-y-2');
+      const order = state.order || [];
+      order.forEach((id, idx) => {
+        const p = state.roster[id];
+        if (!p) return;
+        const row = createElement('div', 'flex items-center gap-2 bg-gray-800 p-2 rounded');
+        // Position
+        row.appendChild(createElement('span', 'w-6 text-center text-xs opacity-60', String(idx + 1)));
+        // Name
+        const nameInput = createElement('input', 'flex-1 p-1 rounded bg-gray-700 border border-gray-600 text-sm');
+        nameInput.value = p.name;
+        nameInput.addEventListener('change', async (e) => {
+          await updateDoc(doc(db, 'rooms', currentRoomId), {
+            [`roster.${id}.name`]: e.target.value
+          });
+        });
+        row.appendChild(nameInput);
+        // Score
+        const minusBtn = createElement('button', 'px-2 py-1 rounded bg-gray-600 hover:bg-gray-700 text-sm', '-');
+        minusBtn.addEventListener('click', async () => {
+          await updateDoc(doc(db, 'rooms', currentRoomId), {
+            [`roster.${id}.score`]: (p.score || 0) - 1
+          });
+        });
+        row.appendChild(minusBtn);
+        const score = createElement('span', 'w-10 text-center', String(p.score || 0));
+        row.appendChild(score);
+        const plusBtn = createElement('button', 'px-2 py-1 rounded bg-gray-600 hover:bg-gray-700 text-sm', '+');
+        plusBtn.addEventListener('click', async () => {
+          await updateDoc(doc(db, 'rooms', currentRoomId), {
+            [`roster.${id}.score`]: (p.score || 0) + 1
+          });
+        });
+        row.appendChild(plusBtn);
+        // Antwort (Host sieht, wenn showAnswers)
+        if (state.host.showAnswers) {
+          const answer = createElement('span', 'flex-1 text-sm italic text-gray-300');
+          answer.textContent = p.answer || '—';
+          row.appendChild(answer);
+        }
+        // Farbe ändern
+        const colorInput = createElement('input', 'w-12 h-6 rounded', null);
+        colorInput.type = 'color';
+        colorInput.value = p.color || colorFromName(p.name);
+        colorInput.addEventListener('change', async (e) => {
+          await updateDoc(doc(db, 'rooms', currentRoomId), {
+            [`roster.${id}.color`]: e.target.value
+          });
+        });
+        row.appendChild(colorInput);
+        playersList.appendChild(row);
+      });
+      // Spieler hinzufügen
+      const addBtn = createElement('button', 'px-3 py-1 rounded bg-blue-600 hover:bg-blue-700 text-sm', '+ Spieler');
+      addBtn.addEventListener('click', async () => {
+        const id = randomId();
+        const name = prompt('Name des neuen Spielers');
+        if (!name) return;
+        const color = colorFromName(name);
+        await updateDoc(doc(db, 'rooms', currentRoomId), {
+          [`roster.${id}`]: {
+            id: id,
+            name: name,
+            color: color,
+            score: 0,
+            answer: ''
+          },
+          order: arrayUnion(id)
+        });
+      });
+      playersSec.appendChild(playersList);
+      playersSec.appendChild(addBtn);
+      content.appendChild(playersSec);
+
+      // Sektion: Sichtbarkeit & Einstellungen
+      const visSec = createElement('div', 'space-y-2');
+      visSec.appendChild(createElement('h3', 'font-semibold', 'Anzeigeeinstellungen'));
+      const opts = [
+        { key: 'showPlayers', label: 'Spieler anzeigen' },
+        { key: 'showScores', label: 'Scores anzeigen' },
+        { key: 'showAnswers', label: 'Antworten anzeigen' }
+      ];
+      opts.forEach(({ key, label }) => {
+        const row = createElement('label', 'flex items-center gap-2 text-sm');
+        const cb = createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = state.host[key];
+        cb.addEventListener('change', async (e) => {
+          await updateDoc(doc(db, 'rooms', currentRoomId), {
+            [`host.${key}`]: e.target.checked
+          });
+        });
+        row.appendChild(cb);
+        row.appendChild(createElement('span', null, label));
+        visSec.appendChild(row);
+      });
+      content.appendChild(visSec);
+
+      // Theme Color
+      const themeRow = createElement('div', 'flex items-center gap-2');
+      themeRow.appendChild(createElement('span', 'text-sm', 'Farbe:'));
+      const colorInput = createElement('input');
+      colorInput.type = 'color';
+      colorInput.value = state.host.themeColor || '#111827';
+      colorInput.addEventListener('change', async (e) => {
+        await updateDoc(doc(db, 'rooms', currentRoomId), {
+          'host.themeColor': e.target.value
+        });
+      });
+      themeRow.appendChild(colorInput);
+      content.appendChild(themeRow);
+    }
+
+    /**
+     * Rendert die Spieleransicht und aktualisiert sie anhand des States.
+     */
+    function updatePlayerUI(state) {
+      // Wenn die Player-View noch nicht existiert, erstelle sie
+      if (!appContainer.dataset.view || appContainer.dataset.view !== 'player') {
+        appContainer.dataset.view = 'player';
+        appContainer.innerHTML = '';
+        const wrapper = createElement('div', 'space-y-4');
+        // Überschrift
+        const header = createElement('div', 'flex justify-between items-center');
+        header.appendChild(createElement('h2', 'text-xl font-bold', `Raum: ${currentRoomId}`));
+        const leaveBtn = createElement('button', 'text-sm text-red-400 hover:text-red-200', 'Leave');
+        leaveBtn.addEventListener('click', () => {
+          currentRole = null;
+          if (unsubscribe) unsubscribe();
+          setQueryParam('room', null);
+          renderStartView();
+        });
+        header.appendChild(leaveBtn);
+        wrapper.appendChild(header);
+        // Inhalte
+        const content = createElement('div', 'space-y-6');
+        content.id = 'player-content';
+        wrapper.appendChild(content);
+        appContainer.appendChild(wrapper);
+      }
+      const content = document.getElementById('player-content');
+      content.innerHTML = '';
+
+      // Frage & Subtext
+      const qSec = createElement('div', 'space-y-1');
+      qSec.appendChild(createElement('h3', 'text-2xl font-bold', state.game.question || ''));
+      qSec.appendChild(createElement('p', 'text-sm text-gray-400', state.game.subtext || ''));
+      content.appendChild(qSec);
+
+      // Antwortfeld
+      const ansSec = createElement('div', 'space-y-1');
+      ansSec.appendChild(createElement('h4', 'font-semibold', 'Deine Antwort'));
+      const ansInput = createElement('textarea', 'w-full p-2 rounded bg-gray-700 border border-gray-600');
+      ansInput.value = state.roster[userId]?.answer || '';
+      ansInput.placeholder = 'Antwort hier eingeben…';
+      ansInput.addEventListener('input', _.debounce(async (e) => {
+        await updateDoc(doc(db, 'rooms', currentRoomId), {
+          [`roster.${userId}.answer`]: e.target.value
+        });
+      }, 300));
+      ansSec.appendChild(ansInput);
+      ansSec.appendChild(createElement('p', 'text-xs text-gray-500', 'Nur der Host kann die Antworten einsehen.'));
+      content.appendChild(ansSec);
+
+      // Buzzer
+      const buzzSec = createElement('div', 'space-y-1');
+      buzzSec.appendChild(createElement('h4', 'font-semibold', 'Buzzer'));
+      const canBuzz = state.buzzer.armed && !(state.buzzer.list || []).includes(userId);
+      const buzzBtn = createElement('button', 'px-4 py-2 rounded text-white');
+      if (canBuzz) {
+        buzzBtn.className += ' bg-green-600 hover:bg-green-700';
+        buzzBtn.textContent = 'Buzz!';
+        buzzBtn.addEventListener('click', async () => {
+          await updateDoc(doc(db, 'rooms', currentRoomId), {
+            [`buzzer.list`]: arrayUnion(userId)
+          });
+        });
+      } else {
+        buzzBtn.className += ' bg-gray-600';
+        buzzBtn.disabled = true;
+        if (!state.buzzer.armed) {
+          buzzBtn.textContent = 'Gesichert';
+        } else {
+          buzzBtn.textContent = 'Geklingelt';
+        }
+      }
+      buzzSec.appendChild(buzzBtn);
+      // Anzeige, ob man erster war
+      if ((state.buzzer.list || [])[0] === userId) {
+        buzzSec.appendChild(createElement('p', 'text-sm text-yellow-300 mt-1', 'Du warst zuerst!'));
+      }
+      content.appendChild(buzzSec);
+
+      // Timer
+      const timeSec = createElement('div', 'space-y-1');
+      timeSec.appendChild(createElement('h4', 'font-semibold', 'Timer'));
+      const timeLeft2 = state.timer.running && state.timer.endsAt ? Math.max(0, state.timer.endsAt - Date.now()) : 0;
+      const mins2 = Math.floor(timeLeft2 / 60000);
+      const secs2 = Math.floor((timeLeft2 % 60000) / 1000);
+      const timerDisplay2 = createElement('span', 'text-xl font-mono');
+      timerDisplay2.textContent = `${String(mins2).padStart(2, '0')}:${String(secs2).padStart(2, '0')}`;
+      timeSec.appendChild(timerDisplay2);
+      content.appendChild(timeSec);
+
+      // Spielerübersicht
+      if (state.host.showPlayers) {
+        const listSec = createElement('div', 'space-y-1');
+        listSec.appendChild(createElement('h4', 'font-semibold', 'Spieler'));
+        const list = createElement('div', 'space-y-1');
+        const order = state.order || [];
+        order.forEach((id) => {
+          const p = state.roster[id];
+          if (!p) return;
+          const row = createElement('div', 'flex items-center gap-2 p-2 rounded', null);
+          row.style.backgroundColor = p.id === userId ? 'rgba(96, 165, 250, 0.2)' : 'rgba(255,255,255,0.05)';
+          row.appendChild(createElement('span', 'h-3 w-3 rounded', null));
+          row.lastChild.style.backgroundColor = p.color;
+          row.appendChild(createElement('span', 'flex-1 text-sm', p.name));
+          if (state.host.showScores) {
+            row.appendChild(createElement('span', 'w-12 text-right text-sm', String(p.score || 0)));
+          }
+          if (state.host.showAnswers) {
+            row.appendChild(createElement('span', 'flex-1 text-xs italic text-gray-400', p.answer || '—'));
+          }
+          list.appendChild(row);
+        });
+        listSec.appendChild(list);
+        content.appendChild(listSec);
+      }
+    }
+
+    /**
+     * Starte die App mit der Start-Ansicht.
+     */
+    renderStartView();
+
+  </script>
+</body>
+</html>
